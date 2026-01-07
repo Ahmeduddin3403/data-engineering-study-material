@@ -1,0 +1,397 @@
+1. BASIC DATABASE PERFORMANCE HEALTH
+1.1 Instance status
+SELECT instance_name, status, database_status
+FROM v$instance;
+
+1.2 CPU usage
+SELECT stat_name, value
+FROM v$sysstat
+WHERE stat_name LIKE '%CPU%';
+
+1.3 Memory usage (SGA & PGA)
+SELECT name, value/1024/1024 AS MB
+FROM v$sga;
+
+SELECT name, value/1024/1024 AS MB
+FROM v$pgastat;
+
+2. FIND SLOW SQL STATEMENTS
+2.1 Top SQL by elapsed time
+SELECT *
+FROM (
+    SELECT sql_id,
+           elapsed_time/1000000 AS elapsed_sec,
+           executions,
+           elapsed_time/DECODE(executions,0,1,executions)/1000000 AS avg_elapsed_sec,
+           sql_text
+    FROM v$sql
+    ORDER BY elapsed_time DESC
+)
+WHERE ROWNUM <= 10;
+
+2.2 Top SQL by CPU usage
+SELECT *
+FROM (
+    SELECT sql_id,
+           cpu_time/1000000 AS cpu_sec,
+           executions,
+           sql_text
+    FROM v$sql
+    ORDER BY cpu_time DESC
+)
+WHERE ROWNUM <= 10;
+
+2.3 Top SQL by logical reads
+SELECT *
+FROM (
+    SELECT sql_id,
+           buffer_gets,
+           executions,
+           buffer_gets/DECODE(executions,0,1,executions) AS avg_gets,
+           sql_text
+    FROM v$sql
+    ORDER BY buffer_gets DESC
+)
+WHERE ROWNUM <= 10;
+
+2.4 SQLs with high disk reads
+SELECT *
+FROM (
+    SELECT sql_id,
+           disk_reads,
+           executions,
+           sql_text
+    FROM v$sql
+    ORDER BY disk_reads DESC
+)
+WHERE ROWNUM <= 10;
+
+3. FIND STUCK / LONG-RUNNING SQL
+3.1 Currently running SQLs
+SELECT s.sid,
+       s.serial#,
+       s.status,
+       s.username,
+       s.sql_id,
+       q.sql_text,
+       s.seconds_in_wait
+FROM v$session s
+JOIN v$sql q ON s.sql_id = q.sql_id
+WHERE s.status = 'ACTIVE'
+AND s.username IS NOT NULL;
+
+3.2 Long running SQL (active > X seconds)
+SELECT sid,
+       serial#,
+       username,
+       sql_id,
+       event,
+       seconds_in_wait
+FROM v$session
+WHERE status = 'ACTIVE'
+AND seconds_in_wait > 300;
+
+3.3 Identify blocking sessions
+SELECT s.sid,
+       s.serial#,
+       s.username,
+       s.blocking_session
+FROM v$session s
+WHERE s.blocking_session IS NOT NULL;
+
+3.4 Find the blocker SQL
+SELECT s.sid,
+       s.serial#,
+       s.username,
+       q.sql_text
+FROM v$session s
+JOIN v$sql q ON s.sql_id = q.sql_id
+WHERE s.sid IN (
+    SELECT blocking_session FROM v$session WHERE blocking_session IS NOT NULL
+);
+
+4. WAIT EVENTS & BOTTLENECKS
+4.1 Current wait events
+SELECT sid, event, wait_class, seconds_in_wait
+FROM v$session
+WHERE wait_class <> 'Idle';
+
+4.2 System-wide wait events
+SELECT event, total_waits, time_waited/100 AS seconds
+FROM v$system_event
+ORDER BY time_waited DESC;
+
+4.3 Top wait classes
+SELECT wait_class, time_waited/100 AS seconds
+FROM v$system_wait_class
+ORDER BY time_waited DESC;
+
+5. CHECK SQL EXECUTION PLANS
+5.1 Get execution plan from shared pool
+SELECT *
+FROM TABLE(dbms_xplan.display_cursor('SQL_ID_HERE', NULL, 'ALLSTATS LAST'));
+
+5.2 Historical execution plan (AWR required)
+SELECT *
+FROM TABLE(dbms_xplan.display_awr('SQL_ID_HERE'));
+
+5.3 See plan hash changes
+SELECT sql_id,
+       plan_hash_value,
+       COUNT(*) executions
+FROM v$sql
+GROUP BY sql_id, plan_hash_value
+HAVING COUNT(*) > 1;
+
+6. SQL TUNING ADVISOR
+6.1 Create tuning task
+BEGIN
+  DBMS_SQLTUNE.create_tuning_task(
+    sql_id => 'SQL_ID_HERE',
+    scope  => 'COMPREHENSIVE',
+    time_limit => 300,
+    task_name => 'TUNE_SQL_ID_HERE'
+  );
+END;
+/
+
+6.2 Execute tuning task
+BEGIN
+  DBMS_SQLTUNE.execute_tuning_task(task_name => 'TUNE_SQL_ID_HERE');
+END;
+/
+
+6.3 View tuning recommendations
+SELECT DBMS_SQLTUNE.report_tuning_task('TUNE_SQL_ID_HERE')
+FROM dual;
+
+6.4 Drop tuning task
+BEGIN
+  DBMS_SQLTUNE.drop_tuning_task('TUNE_SQL_ID_HERE');
+END;
+/
+
+7. AWR – HISTORICAL PERFORMANCE
+7.1 Top SQL by elapsed time (AWR)
+SELECT sql_id,
+       elapsed_time_delta/1000000 AS elapsed_sec
+FROM dba_hist_sqlstat
+ORDER BY elapsed_time_delta DESC
+FETCH FIRST 10 ROWS ONLY;
+
+7.2 Top SQL by executions
+SELECT sql_id, executions_delta
+FROM dba_hist_sqlstat
+ORDER BY executions_delta DESC;
+
+8. LOCKS & CONTENTION
+8.1 Locked objects
+SELECT o.object_name,
+       l.session_id,
+       s.serial#,
+       s.username
+FROM v$locked_object l
+JOIN dba_objects o ON l.object_id = o.object_id
+JOIN v$session s ON l.session_id = s.sid;
+
+8.2 Row lock contention
+SELECT sid, event, seconds_in_wait
+FROM v$session
+WHERE event LIKE 'enq: TX%';
+
+9. KILL A STUCK SESSION (USE CAREFULLY)
+ALTER SYSTEM KILL SESSION 'SID,SERIAL#' IMMEDIATE;
+
+
+
+
+performance master script
+
+SET LINESIZE 200
+SET PAGESIZE 200
+SET LONG 100000
+SET LONGCHUNKSIZE 100000
+COL sql_text FORMAT A80
+COL username FORMAT A15
+COL event FORMAT A30
+COL wait_class FORMAT A15
+
+PROMPT ===============================
+PROMPT DATABASE & INSTANCE STATUS
+PROMPT ===============================
+
+SELECT instance_name, status, database_status
+FROM v$instance;
+
+SELECT name, open_mode FROM v$database;
+
+PROMPT ===============================
+PROMPT CPU & MEMORY
+PROMPT ===============================
+
+SELECT stat_name, value
+FROM v$sysstat
+WHERE stat_name LIKE '%CPU%';
+
+SELECT name, value/1024/1024 AS MB
+FROM v$sga;
+
+SELECT name, value/1024/1024 AS MB
+FROM v$pgastat;
+
+PROMPT ===============================
+PROMPT ACTIVE SESSIONS
+PROMPT ===============================
+
+SELECT sid, serial#, username, status, event, seconds_in_wait
+FROM v$session
+WHERE username IS NOT NULL
+ORDER BY seconds_in_wait DESC;
+
+PROMPT ===============================
+PROMPT LONG RUNNING / STUCK SQL (>5 MIN)
+PROMPT ===============================
+
+SELECT s.sid,
+       s.serial#,
+       s.username,
+       s.sql_id,
+       s.event,
+       s.seconds_in_wait
+FROM v$session s
+WHERE s.status = 'ACTIVE'
+AND s.seconds_in_wait > 300
+ORDER BY seconds_in_wait DESC;
+
+PROMPT ===============================
+PROMPT BLOCKING SESSIONS
+PROMPT ===============================
+
+SELECT sid,
+       serial#,
+       username,
+       blocking_session
+FROM v$session
+WHERE blocking_session IS NOT NULL;
+
+PROMPT ===============================
+PROMPT BLOCKER SQL
+PROMPT ===============================
+
+SELECT s.sid,
+       s.serial#,
+       s.username,
+       q.sql_text
+FROM v$session s
+JOIN v$sql q ON s.sql_id = q.sql_id
+WHERE s.sid IN (
+    SELECT blocking_session FROM v$session WHERE blocking_session IS NOT NULL
+);
+
+PROMPT ===============================
+PROMPT TOP 10 SLOW SQL (ELAPSED TIME)
+PROMPT ===============================
+
+SELECT *
+FROM (
+    SELECT sql_id,
+           elapsed_time/1000000 AS elapsed_sec,
+           executions,
+           elapsed_time/DECODE(executions,0,1,executions)/1000000 AS avg_sec,
+           sql_text
+    FROM v$sql
+    ORDER BY elapsed_time DESC
+)
+WHERE ROWNUM <= 10;
+
+PROMPT ===============================
+PROMPT TOP 10 CPU CONSUMING SQL
+PROMPT ===============================
+
+SELECT *
+FROM (
+    SELECT sql_id,
+           cpu_time/1000000 AS cpu_sec,
+           executions,
+           sql_text
+    FROM v$sql
+    ORDER BY cpu_time DESC
+)
+WHERE ROWNUM <= 10;
+
+PROMPT ===============================
+PROMPT TOP 10 LOGICAL READ SQL
+PROMPT ===============================
+
+SELECT *
+FROM (
+    SELECT sql_id,
+           buffer_gets,
+           executions,
+           buffer_gets/DECODE(executions,0,1,executions) AS avg_gets,
+           sql_text
+    FROM v$sql
+    ORDER BY buffer_gets DESC
+)
+WHERE ROWNUM <= 10;
+
+PROMPT ===============================
+PROMPT WAIT EVENTS (SYSTEM LEVEL)
+PROMPT ===============================
+
+SELECT event, wait_class, total_waits, time_waited/100 AS seconds
+FROM v$system_event
+ORDER BY time_waited DESC;
+
+PROMPT ===============================
+PROMPT TOP WAIT CLASSES
+PROMPT ===============================
+
+SELECT wait_class, time_waited/100 AS seconds
+FROM v$system_wait_class
+ORDER BY time_waited DESC;
+
+PROMPT ===============================
+PROMPT LOCKED OBJECTS
+PROMPT ===============================
+
+SELECT o.object_name,
+       l.session_id,
+       s.serial#,
+       s.username
+FROM v$locked_object l
+JOIN dba_objects o ON l.object_id = o.object_id
+JOIN v$session s ON l.session_id = s.sid;
+
+PROMPT ===============================
+PROMPT ROW LOCK CONTENTION
+PROMPT ===============================
+
+SELECT sid, event, seconds_in_wait
+FROM v$session
+WHERE event LIKE 'enq: TX%';
+
+PROMPT ===============================
+PROMPT PLAN HASH CHANGES (PLAN INSTABILITY)
+PROMPT ===============================
+
+SELECT sql_id,
+       plan_hash_value,
+       COUNT(*) executions
+FROM v$sql
+GROUP BY sql_id, plan_hash_value
+HAVING COUNT(*) > 1;
+
+PROMPT ===============================
+PROMPT AWR TOP SQL (IF LICENSED)
+PROMPT ===============================
+
+SELECT sql_id,
+       elapsed_time_delta/1000000 AS elapsed_sec
+FROM dba_hist_sqlstat
+ORDER BY elapsed_time_delta DESC
+FETCH FIRST 10 ROWS ONLY;
+
+PROMPT ===============================
+PROMPT END OF PERFORMANCE REPORT
+PROMPT ===============================
